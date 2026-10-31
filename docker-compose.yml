@@ -2,7 +2,11 @@ version: "3.8"
 
 services:
   unifi-gateway:
-    image: ghcr.io/amd989/unifi-gateway:latest
+    # Local-only tag: this branch's image is built on the host (docker compose
+    # up -d --build) and is never pulled from a registry. Publishing your own
+    # build later? Change this to your namespace, e.g.
+    # ghcr.io/andrewaubury/unifi-gateway:pfsense
+    image: unifi-gateway:pfsense
     build: .
     container_name: unifi-gateway
     restart: unless-stopped
