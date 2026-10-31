@@ -72,7 +72,10 @@ BASELINE_RULE_HINTS = (
     "allow established/related sessions",
     "drop invalid state",
 )
-
+# Rules UniFi generates to accompany each port forward; the pfSense NAT rule
+# already auto-passes traffic (associated_rule_id: pass), so these would
+# duplicate the allowance.
+BASELINE_RULE_PREFIXES = ("portforward [",)
 # firewall.<key> entries that are not rulesets
 NON_RULESET_FIREWALL_KEYS = ("group", "ipv6-name", "options")
 
@@ -126,8 +129,74 @@ def _first_port(port_value):
     return str(port_value).split(":")[0].split("-")[0].strip()
 
 
-def extract_port_forwards(cfg, ports):
-    """Translate UniFi `port-forward` rules into pfSense port forward payloads."""
+def _pfor_source_info(rule):
+    """Classify the port-forward 'From' restriction (UniFi UI: "Optionally
+    restrict access to the forwarded ports...").
+
+    Returns (mode, value):
+      ("any", None)             no restriction
+      ("direct", "1.2.3.4"|"10.0.0.0/24")   single IP or CIDR: passes through
+      ("alias", ["1.2.3.4", "10.0.0.0/24"]) multi-value list or dash range:
+                                        needs a derived alias (pfSense's
+                                        source field takes one value or an
+                                        alias)
+      ("group", "name")          references a UniFi address group
+      ("skip", None)             unsupported: rule must be skipped
+    """
+    src = rule.get("source") or {}
+    group = src.get("group")
+    if group:
+        for group_type in ADDRESS_GROUP_TYPES:
+            name = group.get(group_type)
+            if name:
+                return ("group", str(name))
+        return ("skip", None)
+    addr = str(src.get("address") or "").strip()
+    if not addr:
+        return ("any", None)
+    parts = [p for p in re.split(r"[,\s]+", addr) if p]
+    if not parts:
+        return ("any", None)
+    if len(parts) == 1 and "-" not in parts[0]:
+        return ("direct", parts[0])
+    return ("alias", parts)
+
+
+def _pfor_source_alias_name(rule_id):
+    return f"unifi_pfor_{rule_id}"
+
+
+def extract_port_forward_source_aliases(cfg):
+    """Aliases for port-forward From-restrictions that hold several values
+    or a dash range. Deterministically named per rule id so reconciliation
+    converges; dropped rules get their alias removed on the next sync."""
+    rules = (cfg.get("port-forward") or {}).get("rule") or {}
+    if not isinstance(rules, dict):
+        return []
+    aliases = []
+    for rule_id, rule in rules.items():
+        if not isinstance(rule, dict):
+            continue
+        mode, value = _pfor_source_info(rule)
+        if mode != "alias":
+            continue
+        alias_type, members = _alias_type_and_members(value, "address-group")
+        description = str(rule.get("description") or f"rule {rule_id}").strip()
+        aliases.append(
+            {
+                "name": _pfor_source_alias_name(rule_id),
+                "type": alias_type,
+                "address": members,
+                "descr": MARKER + f"port forward source: {description}",
+            }
+        )
+    return aliases
+
+
+def extract_port_forwards(cfg, ports, alias_names=()):
+    """Translate UniFi `port-forward` rules into pfSense port forward
+    payloads. From-restrictions become the pfSense source: direct address,
+    alias reference (see extract_port_forward_source_aliases) or 'any'."""
     pf = cfg.get("port-forward") or {}
     rules = pf.get("rule") or {}
     if not isinstance(rules, dict):
@@ -142,6 +211,7 @@ def extract_port_forwards(cfg, ports):
         logger.warning("pfSense sync: cannot map a WAN interface for port forwards")
         return []
 
+    alias_names = set(alias_names)
     desired = []
     for rule_id, rule in rules.items():
         if not isinstance(rule, dict):
@@ -155,15 +225,52 @@ def extract_port_forwards(cfg, ports):
                 "pfSense sync: skipping port-forward %r (no target/port)", description
             )
             continue
+
+        mode, value = _pfor_source_info(rule)
+        if mode == "skip":
+            logger.warning(
+                "pfSense sync: port-forward %r has an unsupported source "
+                "restriction, skipped",
+                description,
+            )
+            continue
+        if mode == "group":
+            if value not in alias_names:
+                logger.warning(
+                    "pfSense sync: port-forward %r source group %r is "
+                    "empty/unknown, forward skipped",
+                    description,
+                    value,
+                )
+                continue
+            source = value
+        elif mode == "direct":
+            source = value
+        elif mode == "alias":
+            alias_name = _pfor_source_alias_name(rule_id)
+            if alias_name not in alias_names:
+                logger.warning(
+                    "pfSense sync: source alias %r missing for port-forward %r",
+                    alias_name,
+                    description,
+                )
+                continue
+            source = alias_name
+        else:
+            source = "any"
+
         local_port = forward_to.get("port") or _first_port(original_port)
         desired.append(
             {
                 "interface": wan_interface,
                 "ipprotocol": "inet",
                 "protocol": _normalize_protocol(rule.get("protocol")) or "tcp",
-                "source": "any",
+                "source": source,
                 "source_port": None,
-                "destination": "(self)",
+                # 'any' is pfSense's canonical stored form for "this
+                # firewall's address" on port forwards; '(self)' gets stored
+                # as 'any' anyway, which would look like a diff every cycle
+                "destination": "any",
                 "destination_port": str(original_port),
                 "target": str(target),
                 "local_port": str(local_port),
@@ -175,6 +282,12 @@ def extract_port_forwards(cfg, ports):
             }
         )
     return desired
+
+
+def _sanitize_alias_name(name):
+    """pfSense alias names allow only [A-Za-z0-9_] (no hyphens -- the API
+    rejects e.g. 'unifi_controller_ports-tcp' with HTTP 400)."""
+    return re.sub(r"[^A-Za-z0-9_]", "_", str(name))
 
 
 def _alias_type_and_members(members, group_type):
@@ -204,6 +317,7 @@ def extract_aliases(system_cfg):
     """
     group = ((system_cfg.get("firewall") or {}).get("group")) or {}
     aliases = []
+    used_names = set()
     for group_type, groups in group.items():
         if group_type not in GROUP_TYPE_TO_ALIAS or not isinstance(groups, dict):
             continue
@@ -216,16 +330,32 @@ def extract_aliases(system_cfg):
             if not members:
                 logger.debug("pfSense sync: group %r is empty, no alias", name)
                 continue
-            if not re.fullmatch(r"[A-Za-z0-9_-]+", str(name)):
+            alias_name = _sanitize_alias_name(name)
+            if alias_name != str(name):
+                logger.debug(
+                    "pfSense sync: alias name %r sanitized to %r", name, alias_name
+                )
+            if not alias_name:
                 logger.warning(
                     "pfSense sync: group name %r is not a valid alias name, skipped",
                     name,
                 )
                 continue
+            if alias_name in used_names:
+                suffix = 2
+                while f"{alias_name}_{suffix}" in used_names:
+                    suffix += 1
+                alias_name = f"{alias_name}_{suffix}"
+                logger.warning(
+                    "pfSense sync: alias name collision on %r, using %r",
+                    name,
+                    alias_name,
+                )
+            used_names.add(alias_name)
             alias_type, members = _alias_type_and_members(members, group_type)
             aliases.append(
                 {
-                    "name": str(name),
+                    "name": alias_name,
                     "type": alias_type,
                     "address": members,
                     "descr": MARKER
@@ -274,6 +404,8 @@ def _is_baseline_rule(rule):
     if "state" in rule:
         return True  # session-state plumbing (pf matches state implicitly)
     if any(hint in description for hint in BASELINE_RULE_HINTS):
+        return True
+    if any(description.startswith(p) for p in BASELINE_RULE_PREFIXES):
         return True
     # auto-generated per-network rule
     return description.startswith("allow network ") and description.endswith("traffic")
@@ -455,8 +587,12 @@ def _reconcile(
                 stats["created"] += 1
                 logger.info("pfSense sync: created %s %r", label, name)
             elif op == "update":
+                # Some RESTAPI builds read the target id from the JSON body
+                # rather than the query string, so send it in both.
+                body = dict(rule)
+                body["id"] = existing_rule["id"]
                 client.request(
-                    "PATCH", single_path, body=rule, params={"id": existing_rule["id"]}
+                    "PATCH", single_path, body=body, params={"id": existing_rule["id"]}
                 )
                 stats["updated"] += 1
                 logger.info("pfSense sync: updated %s %r", label, name)
@@ -515,7 +651,20 @@ def apply_config(client, cfg, ports, system_cfg=None, allow_unsafe=False):
             },
         }
 
-    aliases = extract_aliases(system_cfg or cfg or {})
+    # Aliases first: rules and port forwards reference them.
+    # Port-forward From-restrictions with several values add derived aliases.
+    pf_source = next(
+        (
+            c
+            for c in (cfg, system_cfg)
+            if c and (c.get("port-forward") or {}).get("rule")
+        ),
+        None,
+    )
+    pfor_source_aliases = (
+        extract_port_forward_source_aliases(pf_source) if pf_source else []
+    )
+    aliases = extract_aliases(system_cfg or cfg or {}) + pfor_source_aliases
     stats = {"aliases": {"found": len(aliases)}}
     stats["aliases"].update(
         _reconcile(
@@ -530,15 +679,11 @@ def apply_config(client, cfg, ports, system_cfg=None, allow_unsafe=False):
     )
     alias_names = {a["name"] for a in aliases}
 
-    pf_source = next(
-        (
-            c
-            for c in (cfg, system_cfg)
-            if c and (c.get("port-forward") or {}).get("rule")
-        ),
-        None,
+    port_forwards = (
+        extract_port_forwards(pf_source, ports, alias_names=alias_names)
+        if pf_source
+        else []
     )
-    port_forwards = extract_port_forwards(pf_source, ports) if pf_source else []
     stats["port_forwards"] = {"found": len(port_forwards)}
     stats["port_forwards"].update(
         _reconcile(

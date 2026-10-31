@@ -104,6 +104,12 @@ SYSTEM_CFG = {
             "WAN_IN": {
                 "default-action": "drop",
                 "rule": {
+                    "1999": {
+                        "action": "accept",
+                        "description": "PortForward [Web port test]",
+                        "destination": {"address": "10.0.0.62", "port": "8971"},
+                        "protocol": "tcp",
+                    },
                     "2000": {
                         "action": "accept",
                         "description": "Test",
@@ -209,7 +215,7 @@ class TestPortForwardExtraction:
             "protocol": "tcp",
             "source": "any",
             "source_port": None,
-            "destination": "(self)",
+            "destination": "any",
             "destination_port": "80",
             "target": "10.0.0.10",
             "local_port": "80",
@@ -289,6 +295,132 @@ class TestAliasExtraction:
 
     def test_no_groups(self):
         assert pfsense_sync.extract_aliases({}) == []
+
+    def test_alias_name_sanitized(self):
+        # pfSense rejects hyphens in alias names (verified live: HTTP 400)
+        cfg = {
+            "firewall": {
+                "group": {
+                    "port-group": {
+                        "unifi_controller_ports-tcp": {
+                            "description": "tcp",
+                            "port": [8080],
+                        },
+                    }
+                }
+            }
+        }
+        aliases = pfsense_sync.extract_aliases(cfg)
+        assert aliases[0]["name"] == "unifi_controller_ports_tcp"
+
+    def test_alias_name_collision_disambiguated(self):
+        cfg = {
+            "firewall": {
+                "group": {
+                    "address-group": {
+                        "a-b": {"address": ["10.0.0.1"]},
+                        "a_b": {"address": ["10.0.0.2"]},
+                    }
+                }
+            }
+        }
+        names = [a["name"] for a in pfsense_sync.extract_aliases(cfg)]
+        assert names == ["a_b", "a_b_2"]
+
+
+# UniFi "Optionally restrict access to the forwarded ports..." (From field)
+PFOR_CFG = {
+    "port-forward": {
+        "wan-interface": "eth0",
+        "lan-interface": "eth1",
+        "rule": {
+            "1": {
+                "description": "restricted single",
+                "forward-to": {"address": "10.0.0.10", "port": "9000"},
+                "original-port": "9000",
+                "protocol": "tcp",
+                "source": {"address": "81.2.100.4"},
+            },
+            "2": {
+                "description": "restricted list",
+                "forward-to": {"address": "10.0.0.11", "port": "9001"},
+                "original-port": "9001",
+                "protocol": "tcp",
+                "source": {"address": "81.2.100.4,81.2.100.0/24"},
+            },
+            "3": {
+                "description": "restricted range",
+                "forward-to": {"address": "10.0.0.12", "port": "9002"},
+                "original-port": "9002",
+                "protocol": "tcp",
+                "source": {"address": "81.2.100.10-81.2.100.20"},
+            },
+            "4": {
+                "description": "group restricted",
+                "forward-to": {"address": "10.0.0.13", "port": "9003"},
+                "original-port": "9003",
+                "protocol": "tcp",
+                "source": {"group": {"address-group": "corporate_network"}},
+            },
+        },
+    },
+}
+
+
+class TestPortForwardFromRestrictions:
+    def test_restriction_modes(self):
+        forwards = pfsense_sync.extract_port_forwards(
+            PFOR_CFG,
+            PORTS,
+            alias_names={"corporate_network", "unifi_pfor_2", "unifi_pfor_3"},
+        )
+        by_name = {f["descr"][len("unifi:") :]: f for f in forwards}
+        assert len(forwards) == 4
+        # single IP or CIDR passes straight through
+        assert by_name["restricted single"]["source"] == "81.2.100.4"
+        # lists and dash ranges reference a derived alias
+        assert by_name["restricted list"]["source"] == "unifi_pfor_2"
+        assert by_name["restricted range"]["source"] == "unifi_pfor_3"
+        # group references resolve to the synced alias
+        assert by_name["group restricted"]["source"] == "corporate_network"
+
+    def test_unknown_group_skips_forward(self):
+        forwards = pfsense_sync.extract_port_forwards(PFOR_CFG, PORTS)
+        assert all(f["descr"] != "unifi:group restricted" for f in forwards)
+
+    def test_source_aliases_derived(self):
+        aliases = pfsense_sync.extract_port_forward_source_aliases(PFOR_CFG)
+        by_name = {a["name"]: a for a in aliases}
+        assert set(by_name) == {"unifi_pfor_2", "unifi_pfor_3"}
+        # mixed list: CIDR present -> network alias, bare IP normalized to /32
+        assert by_name["unifi_pfor_2"]["type"] == "network"
+        assert by_name["unifi_pfor_2"]["address"] == [
+            "81.2.100.4/32",
+            "81.2.100.0/24",
+        ]
+        # dash range -> host alias (pfSense host aliases accept ranges)
+        assert by_name["unifi_pfor_3"]["type"] == "host"
+        assert by_name["unifi_pfor_3"]["address"] == ["81.2.100.10-81.2.100.20"]
+        assert all(a["descr"].startswith(pfsense_sync.MARKER) for a in aliases)
+
+    def test_apply_flow_with_restrictions(self):
+        fake = FakePfSense()
+        stats = pfsense_sync.apply_config(fake, PFOR_CFG, PORTS)
+        assert stats["aliases"]["created"] == 2
+        # group-restricted forward skipped: corporate_network has no alias here
+        assert stats["port_forwards"]["created"] == 3
+
+        calls_after_first = len(fake.calls)
+        stats = pfsense_sync.apply_config(fake, PFOR_CFG, PORTS)
+        assert stats["port_forwards"]["created"] == 0
+        assert stats["aliases"]["updated"] == 0
+        assert stats["port_forwards"]["unchanged"] == 3
+        mutations = [
+            c
+            for c in fake.calls[calls_after_first:]
+            if c[0] in ("POST", "PATCH", "DELETE")
+        ]
+        assert mutations == []
 
 
 class TestFirewallRuleExtraction:
@@ -480,6 +612,13 @@ class TestReconcile:
         assert fake.port_forwards[0]["target"] == "10.0.0.1"
         # stale rule was updated to the desired target
         assert fake.port_forwards[2]["target"] == "10.0.0.99"
+        # PATCH must carry the id in BOTH query and body: some RESTAPI
+        # builds (v2.4.3 on pfSense 2.7.2, verified live) reject a PATCH
+        # whose body lacks the id with "Field `id` is required"
+        patches = [c for c in fake.calls if c[0] == "PATCH"]
+        assert patches
+        for _method, _path, body, params in patches:
+            assert body["id"] == params["id"]
 
     def test_idempotent(self):
         fake = FakePfSense(port_forwards=[_forward("stable")])
