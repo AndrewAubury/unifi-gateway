@@ -65,6 +65,117 @@ UNIFI_CFG = {
     },
 }
 
+# Mirrors the real structure pushed by UniFi Network 10.x as `system_cfg`
+SYSTEM_CFG = {
+    "firewall": {
+        "group": {
+            "address-group": {
+                "guest_portal_address": {
+                    "description": "guest portal address",
+                    "address": ["10.0.0.62"],
+                },
+                "guest_restricted": {
+                    "description": "restricted addresses for guests",
+                    "address": ["192.168.0.0/16", "10.0.0.0/8"],
+                },
+                "authorized_guests": {"description": "authorized guests"},
+            },
+            "network-group": {
+                "corporate_network": {
+                    "description": "corporate subnets",
+                    "network": ["10.0.0.0/23"],
+                },
+                "guest_network": {"description": "guest subnets"},
+            },
+            "port-group": {
+                "guest_portal_ports": {
+                    "description": "guest portal ports",
+                    "port": [8880, 8843],
+                },
+            },
+        },
+        "ipv6-name": {
+            "WANv6_IN": {
+                "default-action": "drop",
+                "rule": {"3001": {"action": "accept", "protocol": "ipv6-icmp"}},
+            },
+        },
+        "name": {
+            "WAN_IN": {
+                "default-action": "drop",
+                "rule": {
+                    "2000": {
+                        "action": "accept",
+                        "description": "Test",
+                        "log": "enable",
+                        "protocol": "all",
+                    },
+                    "2001": {
+                        "action": "drop",
+                        "description": "block corp from wan",
+                        "destination": {
+                            "group": {"network-group": "corporate_network"}
+                        },
+                        "source": {"address": "5.6.7.8"},
+                    },
+                    "2002": {
+                        "action": "drop",
+                        "description": "drop guest net",
+                        "source": {"group": {"network-group": "guest_network"}},
+                    },
+                    "3001": {
+                        "action": "accept",
+                        "description": "allow established/related sessions",
+                        "state": {"established": "enable"},
+                    },
+                    "3002": {
+                        "action": "drop",
+                        "description": "drop invalid state",
+                        "state": {"invalid": "enable"},
+                    },
+                },
+            },
+            "WAN_LOCAL": {
+                "default-action": "drop",
+                "rule": {
+                    "3001": {
+                        "action": "accept",
+                        "description": "allow established/related sessions",
+                        "state": {"established": "enable"},
+                    },
+                },
+            },
+            "LAN_IN": {
+                "default-action": "accept",
+                "rule": {
+                    "6001": {
+                        "action": "accept",
+                        "description": "Allow Network 10.0.0.0/23 Traffic",
+                        "source": {"address": "10.0.0.0/23"},
+                    },
+                },
+            },
+            "GUEST_IN": {
+                "default-action": "accept",
+                "rule": {
+                    "3005": {
+                        "action": "drop",
+                        "description": "Block Restricted Traffic",
+                        "destination": {"group": {"address-group": "guest_restricted"}},
+                    },
+                },
+            },
+        },
+        "options": {"mss-clamp": {"mss": "1452"}},
+    },
+    "port-forward": {
+        "wan-interface": "eth0",
+        "lan-interface": "eth1",
+        "auto-firewall": "disable",
+    },
+    "interfaces": {},
+}
+
 
 class TestParseCfg:
     def test_plain_json(self):
@@ -108,11 +219,12 @@ class TestPortForwardExtraction:
             "descr": "unifi:web",
         }
         game = next(f for f in forwards if f["descr"] == "unifi:game range")
-        # 'both' protocol maps to tcp/udp, missing forward-to port falls back
-        # to the first port of the original range
         assert game["protocol"] == "tcp/udp"
         assert game["destination_port"] == "6000:6002"
         assert game["local_port"] == "6000"
+
+    def test_system_cfg_port_forward_section_without_rules(self):
+        assert pfsense_sync.extract_port_forwards(SYSTEM_CFG, PORTS) == []
 
     def test_no_port_forward_section(self):
         assert pfsense_sync.extract_port_forwards({}, PORTS) == []
@@ -128,13 +240,36 @@ class TestPortForwardExtraction:
         assert pfsense_sync.extract_port_forwards(cfg, PORTS) == []
 
 
+class TestAliasExtraction:
+    def test_groups_to_aliases(self):
+        aliases = pfsense_sync.extract_aliases(SYSTEM_CFG)
+        by_name = {a["name"]: a for a in aliases}
+        # empty groups (authorized_guests, guest_network) are excluded
+        assert set(by_name) == {
+            "guest_portal_address",
+            "guest_restricted",
+            "corporate_network",
+            "guest_portal_ports",
+        }
+        corp = by_name["corporate_network"]
+        assert corp["type"] == "network"
+        assert corp["address"] == ["10.0.0.0/23"]
+        assert corp["descr"].startswith("unifi:")
+        ports = by_name["guest_portal_ports"]
+        assert ports["type"] == "port"
+        assert ports["address"] == ["8880", "8843"]
+
+    def test_no_groups(self):
+        assert pfsense_sync.extract_aliases({}) == []
+
+
 class TestFirewallRuleExtraction:
     def test_translation(self):
         rules = pfsense_sync.extract_firewall_rules(UNIFI_CFG, PORTS)
         by_name = {r["descr"]: r for r in rules}
-        # group-based rule is skipped
+        # group-based rule without an alias is skipped
         assert len(rules) == 3
-        assert by_name["unifi:allow http"] == {
+        assert by_name["unifi:WAN_IN - allow http"] == {
             "type": "pass",
             "interface": ["wan"],
             "ipprotocol": "inet",
@@ -146,12 +281,50 @@ class TestFirewallRuleExtraction:
             "disabled": False,
             "log": False,
             "statetype": "keep state",
-            "descr": "unifi:allow http",
+            "descr": "unifi:WAN_IN - allow http",
         }
-        assert by_name["unifi:block bad subnet"]["type"] == "block"
-        assert by_name["unifi:lan thing"]["interface"] == ["lan"]
-        assert by_name["unifi:lan thing"]["type"] == "reject"
-        assert by_name["unifi:lan thing"]["log"] is True
+        assert by_name["unifi:WAN_IN - block bad subnet"]["type"] == "block"
+        assert by_name["unifi:LAN_LOCAL - lan thing"]["interface"] == ["lan"]
+        assert by_name["unifi:LAN_LOCAL - lan thing"]["type"] == "reject"
+        assert by_name["unifi:LAN_LOCAL - lan thing"]["log"] is True
+
+    def test_baseline_rules_filtered(self):
+        # state rules, auto "Allow Network ..." rules, GUEST_*/ipv6 rulesets,
+        # group/ipv6-name/options keys: all filtered out
+        alias_names = {
+            "guest_portal_address",
+            "guest_restricted",
+            "corporate_network",
+            "guest_portal_ports",
+        }
+        rules = pfsense_sync.extract_firewall_rules(
+            SYSTEM_CFG, PORTS, alias_names=alias_names
+        )
+        # WAN_IN 2000 "Test" is an unrestricted WAN accept: skipped by default
+        # WAN_IN 2002 references the empty guest_network group: skipped
+        assert [r["descr"] for r in rules] == ["unifi:WAN_IN - block corp from wan"]
+        rule = rules[0]
+        assert rule["type"] == "block"
+        assert rule["source"] == "5.6.7.8"
+        assert rule["destination"] == "corporate_network"  # alias reference
+
+    def test_unsafe_wan_pass_with_flag(self):
+        alias_names = {
+            "guest_portal_address",
+            "guest_restricted",
+            "corporate_network",
+            "guest_portal_ports",
+        }
+        rules = pfsense_sync.extract_firewall_rules(
+            SYSTEM_CFG, PORTS, alias_names=alias_names, allow_unsafe=True
+        )
+        by_name = {r["descr"]: r for r in rules}
+        test_rule = by_name["unifi:WAN_IN - Test"]
+        assert test_rule["type"] == "pass"
+        assert test_rule["protocol"] is None
+        assert test_rule["source"] == "any"
+        assert test_rule["destination"] == "any"
+        assert test_rule["log"] is True
 
 
 class FakePfSense:
@@ -161,6 +334,7 @@ class FakePfSense:
     def __init__(self, port_forwards=None):
         self.port_forwards = port_forwards or []
         self.rules = []
+        self.aliases = []
         self.calls = []
 
     def request(self, method, path, body=None, params=None):
@@ -190,6 +364,19 @@ class FakePfSense:
                 return target
             if method == "DELETE":
                 self.rules.pop(params["id"])
+                return {}
+        if path == "/firewall/aliases" and method == "GET":
+            return [dict(a, id=i) for i, a in enumerate(self.aliases)]
+        if path == "/firewall/alias":
+            if method == "POST":
+                self.aliases.append(dict(body))
+                return dict(body)
+            if method == "PATCH":
+                target = self.aliases[params["id"]]
+                target.update(body)
+                return target
+            if method == "DELETE":
+                self.aliases.pop(params["id"])
                 return {}
         if path == "/firewall/apply" and method == "GET":
             return {"applied": True, "pending_subsystems": []}
@@ -301,10 +488,48 @@ class TestApplyConfig:
         stats = pfsense_sync.apply_config(fake, UNIFI_CFG, PORTS)
         assert stats["port_forwards"]["created"] == 2
         assert stats["firewall_rules"]["created"] == 3
+        assert stats["aliases"]["created"] == 0
         assert len(fake.port_forwards) == 2
         assert all(
             r["descr"].startswith(pfsense_sync.MARKER) for r in fake.port_forwards
         )
+
+    def test_system_cfg_flow(self):
+        fake = FakePfSense()
+        stats = pfsense_sync.apply_config(fake, None, PORTS, system_cfg=SYSTEM_CFG)
+        assert stats["aliases"]["created"] == 4
+        assert {a["name"] for a in fake.aliases} == {
+            "guest_portal_address",
+            "guest_restricted",
+            "corporate_network",
+            "guest_portal_ports",
+        }
+        # all aliases are tagged, so their descr carries the marker
+        assert all(a["descr"].startswith(pfsense_sync.MARKER) for a in fake.aliases)
+        # "Test" (unsafe WAN accept) skipped; only the group rule is created
+        assert stats["firewall_rules"]["created"] == 1
+        assert fake.rules[0]["descr"] == "unifi:WAN_IN - block corp from wan"
+        assert fake.rules[0]["destination"] == "corporate_network"
+        # no port-forward rules in system_cfg
+        assert stats["port_forwards"]["created"] == 0
+
+    def test_system_cfg_idempotent(self):
+        fake = FakePfSense()
+        pfsense_sync.apply_config(fake, None, PORTS, system_cfg=SYSTEM_CFG)
+        calls_after_first = len(fake.calls)
+        stats = pfsense_sync.apply_config(fake, None, PORTS, system_cfg=SYSTEM_CFG)
+        assert stats["aliases"]["created"] == 0
+        assert stats["aliases"]["updated"] == 0
+        assert stats["aliases"]["deleted"] == 0
+        assert stats["aliases"]["unchanged"] == 4
+        assert stats["firewall_rules"]["created"] == 0
+        assert stats["firewall_rules"]["unchanged"] == 1
+        mutations = [
+            c
+            for c in fake.calls[calls_after_first:]
+            if c[0] in ("POST", "PATCH", "DELETE")
+        ]
+        assert mutations == []
 
     def test_no_changes_no_mutations(self):
         # Seed pfSense with exactly what apply_config would create

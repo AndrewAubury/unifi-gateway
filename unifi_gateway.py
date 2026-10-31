@@ -430,10 +430,9 @@ class UnifiGateway(Daemon):
         return self._pfsense_client
 
     def _handle_controller_cfg(self, raw):
-        """Handle the full gateway config pushed by the controller.
+        """Handle the full gateway config pushed via the mgmt_cfg `cfg` key.
 
-        Translates UniFi port-forward/firewall rules to pfSense via the
-        REST API when [pfsense] sync_firewall is enabled (default).
+        Dumps it for inspection and feeds the pfSense firewall sync.
         """
         try:
             cfg = pfsense_sync.parse_cfg(raw)
@@ -453,45 +452,12 @@ class UnifiGateway(Daemon):
         except OSError as e:
             logger.debug("Could not write controller cfg dump: %s", e)
 
-        if not self.config.has_section("pfsense"):
-            logger.debug("No [pfsense] section, skipping firewall sync")
-            return
-        if not self.config.getboolean("pfsense", "sync_firewall", fallback=True):
-            logger.debug("pfSense firewall sync disabled in config")
-            return
-
-        client = self._get_pfsense_client()
-        if client is None:
-            logger.warning(
-                "pfSense firewall sync enabled but API not configured "
-                "([pfsense] url + api_key or username/password)"
-            )
-            return
-
-        ports = ast.literal_eval(self.config.get("gateway", "ports"))
-        try:
-            stats = pfsense_sync.apply_config(client, cfg, ports)
-            logger.info(
-                "pfSense sync: %d port forward(s) [%d created, %d updated, "
-                "%d deleted], %d firewall rule(s) [%d created, %d updated, "
-                "%d deleted]",
-                stats["port_forwards"]["found"],
-                stats["port_forwards"]["created"],
-                stats["port_forwards"]["updated"],
-                stats["port_forwards"]["deleted"],
-                stats["firewall_rules"]["found"],
-                stats["firewall_rules"]["created"],
-                stats["firewall_rules"]["updated"],
-                stats["firewall_rules"]["deleted"],
-            )
-        except Exception:
-            logger.exception("pfSense sync failed")
+        self._sync_to_pfsense(cfg=cfg, system_cfg=self._system_cfg)
 
     def _handle_system_cfg(self, raw):
-        """Handle the controller's system_cfg setparam: an EdgeOS-style JSON
-        config containing firewall groups (network/address/port), global
-        firewall options, etc. Parsed and dumped for inspection; firewall
-        groups are a future input for the pfSense alias sync."""
+        """Handle the controller's system_cfg setparam: on Network 10.x this
+        carries the full EdgeOS-style config (firewall groups + user rules).
+        Dumps it for inspection and feeds the pfSense firewall sync."""
         try:
             cfg = pfsense_sync.parse_cfg(raw)
         except ValueError as e:
@@ -511,6 +477,53 @@ class UnifiGateway(Daemon):
                 json.dump(cfg, f, indent=2, sort_keys=True)
         except OSError as e:
             logger.debug("Could not write system_cfg dump: %s", e)
+
+        self._sync_to_pfsense(cfg=None, system_cfg=cfg)
+
+    def _sync_to_pfsense(self, cfg, system_cfg):
+        """Translate controller config to pfSense (one-way firewall sync)."""
+        if not self.config.has_section("pfsense"):
+            logger.debug("No [pfsense] section, skipping firewall sync")
+            return
+        if not self.config.getboolean("pfsense", "sync_firewall", fallback=True):
+            logger.debug("pfSense firewall sync disabled in config")
+            return
+
+        client = self._get_pfsense_client()
+        if client is None:
+            logger.warning(
+                "pfSense firewall sync enabled but API not configured "
+                "([pfsense] url + api_key or username/password)"
+            )
+            return
+
+        ports = ast.literal_eval(self.config.get("gateway", "ports"))
+        allow_unsafe = self.config.getboolean(
+            "pfsense", "sync_unsafe_rules", fallback=False
+        )
+        try:
+            stats = pfsense_sync.apply_config(
+                client, cfg, ports, system_cfg=system_cfg, allow_unsafe=allow_unsafe
+            )
+            logger.info(
+                "pfSense sync: %d alias(es) [%d created, %d updated, %d deleted], "
+                "%d port forward(s) [%d created, %d updated, %d deleted], "
+                "%d firewall rule(s) [%d created, %d updated, %d deleted]",
+                stats["aliases"]["found"],
+                stats["aliases"]["created"],
+                stats["aliases"]["updated"],
+                stats["aliases"]["deleted"],
+                stats["port_forwards"]["found"],
+                stats["port_forwards"]["created"],
+                stats["port_forwards"]["updated"],
+                stats["port_forwards"]["deleted"],
+                stats["firewall_rules"]["found"],
+                stats["firewall_rules"]["created"],
+                stats["firewall_rules"]["updated"],
+                stats["firewall_rules"]["deleted"],
+            )
+        except Exception:
+            logger.exception("pfSense sync failed")
 
     def _send_inform(self, data, encryption="CBC"):
         headers = {

@@ -225,12 +225,14 @@ Notes:
 
 #### Firewall / port-forwarding sync (UniFi → pfSense)
 
-Port forwards and simple firewall rules you create in the UniFi UI are pushed to the gateway by the controller and **translated to pfSense** via the REST API:
+The controller's gateway config — the `cfg` mgmt_cfg key, or `system_cfg` on Network 10.x — is translated to pfSense via the REST API:
 
-- Only rules tagged with the `unifi:` description prefix are managed — rules you created directly on pfSense are never touched or removed.
-- Enabled by default whenever `[pfsense]` is configured; disable with `sync_firewall = False` in the `[pfsense]` section.
-- Port forwards map to pfSense NAT port forwards (`(self)` destination, auto-pass); simple accept/drop/reject firewall rules with source/destination/port translate to pfSense filter rules. Rules using UniFi address groups are currently skipped and logged.
-- The full config UniFi pushes is dumped to `conf/controller_cfg.json` (gitignored) for inspection.
+- **Firewall groups → pfSense aliases** (`unifi:`-tagged): rules that reference UniFi address/network/port groups keep working. Empty groups (populated dynamically by the controller) are skipped, and rules referencing them are skipped with a warning.
+- **Port forwards → pfSense NAT port forwards** (`(self)` destination, auto-pass).
+- **User traffic rules → pfSense filter rules.** Only *user* rules sync: UniFi's baseline plumbing (session-state rules, guest-portal rulesets, auto-generated per-network rules) is filtered out so your pfSense policy isn't shadowed.
+- Managed objects are tagged with the `unifi:` description prefix — anything created directly on pfSense is never touched. Deletes/removals in UniFi remove the corresponding tagged object on pfSense.
+- **Safety guard:** an unrestricted accept rule on WAN (no source/destination restriction) is *not* synced unless you set `sync_unsafe_rules = True` in `[pfsense]` — pfSense is the real firewall, so a misclicked "allow all" in the UniFi UI must not silently open it.
+- Enabled by default when `[pfsense]` is configured; disable with `sync_firewall = False`. The raw config UniFi pushes is dumped to `conf/controller_cfg.json` / `conf/system_cfg.json` (gitignored) for inspection.
 
 Note the limits of one-way sync: UniFi's UI always displays the rules stored in its own database, so port forwards created directly on pfSense keep working on the router but will not be listed inside UniFi.
 
@@ -329,6 +331,7 @@ Updates are handled by your package manager: `apt upgrade`, `dnf upgrade`, `opkg
 | `username` / `password` | *(none)* | Alternative auth (JWT fetched and auto-refreshed) |
 | `verify_ssl` | `False` | Verify the pfSense TLS certificate |
 | `sync_firewall` | `True` | Apply UniFi port-forward/firewall rules to pfSense |
+| `sync_unsafe_rules` | `False` | Allow syncing unrestricted accept-all rules on WAN (dangerous) |
 | `timeout` | `30` | API request timeout (seconds) |
 
 #### `[provisioned]`
