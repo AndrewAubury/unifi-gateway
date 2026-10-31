@@ -255,9 +255,37 @@ class TestAliasExtraction:
         assert corp["type"] == "network"
         assert corp["address"] == ["10.0.0.0/23"]
         assert corp["descr"].startswith("unifi:")
+        # bare IPs must land in a host alias: pfSense rejects them in
+        # network aliases ("not a valid CIDR, FQDN, or alias")
+        portal = by_name["guest_portal_address"]
+        assert portal["type"] == "host"
+        assert portal["address"] == ["10.0.0.62"]
         ports = by_name["guest_portal_ports"]
         assert ports["type"] == "port"
         assert ports["address"] == ["8880", "8843"]
+
+    def test_mixed_members_use_network_with_normalized_hosts(self):
+        cfg = {
+            "firewall": {
+                "group": {
+                    "address-group": {
+                        "mixed": {
+                            "description": "mixed",
+                            "address": ["10.0.0.62", "10.0.0.0/23"],
+                        },
+                    }
+                }
+            }
+        }
+        aliases = pfsense_sync.extract_aliases(cfg)
+        assert aliases == [
+            {
+                "name": "mixed",
+                "type": "network",
+                "address": ["10.0.0.62/32", "10.0.0.0/23"],
+                "descr": "unifi:mixed",
+            }
+        ]
 
     def test_no_groups(self):
         assert pfsense_sync.extract_aliases({}) == []

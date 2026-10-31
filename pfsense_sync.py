@@ -177,6 +177,24 @@ def extract_port_forwards(cfg, ports):
     return desired
 
 
+def _alias_type_and_members(members, group_type):
+    """Pick the pfSense alias type from the member content.
+
+    pfSense rejects bare IPs in `network` aliases (they must be CIDRs) and
+    CIDRs are unusual in `host` aliases, so:
+      port-group               -> port
+      any member has a CIDR /  -> network, bare IPs normalized to /32
+      bare IPs/FQDNs only      -> host
+    """
+    members = [str(m) for m in members]
+    if group_type == "port-group":
+        return "port", members
+    if any("/" in m for m in members):
+        normalized = [m if "/" in m else f"{m}/32" for m in members]
+        return "network", normalized
+    return "host", members
+
+
 def extract_aliases(system_cfg):
     """Translate UniFi firewall groups into pfSense alias payloads.
 
@@ -187,8 +205,7 @@ def extract_aliases(system_cfg):
     group = ((system_cfg.get("firewall") or {}).get("group")) or {}
     aliases = []
     for group_type, groups in group.items():
-        alias_type = GROUP_TYPE_TO_ALIAS.get(group_type)
-        if not alias_type or not isinstance(groups, dict):
+        if group_type not in GROUP_TYPE_TO_ALIAS or not isinstance(groups, dict):
             continue
         for name, gdef in groups.items():
             if not isinstance(gdef, dict):
@@ -205,11 +222,12 @@ def extract_aliases(system_cfg):
                     name,
                 )
                 continue
+            alias_type, members = _alias_type_and_members(members, group_type)
             aliases.append(
                 {
                     "name": str(name),
                     "type": alias_type,
-                    "address": [str(m) for m in members],
+                    "address": members,
                     "descr": MARKER
                     + str(gdef.get("description") or f"UniFi group {name}"),
                 }
