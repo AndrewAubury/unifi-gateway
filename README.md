@@ -287,6 +287,7 @@ Updates are handled by your package manager: `apt upgrade`, `dnf upgrade`, `opkg
 | `UNIFI_ADOPT_KEY` | *(none)* | Auth key for auto-adoption (optional, rarely needed) |
 | `UNIFI_GW_PFSENSE_URL` | *(none)* | Overrides `[pfsense]` url |
 | `UNIFI_GW_PFSENSE_API_KEY` | *(none)* | Overrides `[pfsense]` api_key |
+| `UNIFI_GW_VERIFY_CONTROLLER_SSL` | `True` | Verify TLS cert when the inform URL is `https://` (for self-signed controller certs set to `False`, or `verify_controller_ssl` in `[gateway]`) |
 
 ### Config File (`conf/unifi-gateway.conf`)
 

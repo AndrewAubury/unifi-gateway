@@ -8,6 +8,7 @@ import logging.handlers
 import os
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -476,8 +477,8 @@ class UnifiGateway(Daemon):
                 stats["firewall_rules"]["updated"],
                 stats["firewall_rules"]["deleted"],
             )
-        except Exception as e:
-            logger.exception("pfSense sync failed: %s", e)
+        except Exception:
+            logger.exception("pfSense sync failed")
 
     def _send_inform(self, data, encryption="CBC"):
         headers = {
@@ -490,9 +491,24 @@ class UnifiGateway(Daemon):
         request = urllib.request.Request(
             url, encode_inform(self.config, data, encryption=encryption), headers
         )
+        context = None
+        if url.lower().startswith("https"):
+            verify_ssl = os.environ.get(
+                "UNIFI_GW_VERIFY_CONTROLLER_SSL",
+                str(
+                    self.config.getboolean(
+                        "gateway", "verify_controller_ssl", fallback=True
+                    )
+                ),
+            ).lower() in ("1", "true", "yes")
+            if not verify_ssl:
+                context = ssl.create_default_context()
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                logger.debug("TLS verification disabled for controller inform")
         logger.debug("Sending inform to %s", url)
         try:
-            response = urllib.request.urlopen(request, timeout=30)
+            response = urllib.request.urlopen(request, timeout=30, context=context)
         except urllib.error.HTTPError as e:
             return {"_type": "httperror", "code": str(e.code), "msg": str(e.reason)}
         except urllib.error.URLError as e:
