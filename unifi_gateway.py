@@ -71,6 +71,7 @@ class UnifiGateway(Daemon):
         self.datacollector = None
         self._unhandled = {}
         self._pfsense_client = None
+        self._system_cfg = None
         Daemon.__init__(self, pidfile=self.config.get("global", "pid_file"), **kwargs)
 
     def _init_collector(self):
@@ -201,10 +202,16 @@ class UnifiGateway(Daemon):
                 "server_time_in_utc",
                 "blocked_sta",
                 "mgmt_cfg",
+                "cfgversion",
+                "system_cfg",
             }
             for key, value in response.items():
                 if key == "mgmt_cfg":
                     self._parse_mgmt_cfg(value)
+                elif key == "cfgversion":
+                    self.config.set("provisioned", "cfgversion", str(value))
+                elif key == "system_cfg":
+                    self._handle_system_cfg(value)
                 if key not in ("_type", "server_time_in_utc", "blocked_sta"):
                     self.config.set("provisioned", key, str(value))
                 if key not in HANDLED_SETPARAM_KEYS:
@@ -479,6 +486,31 @@ class UnifiGateway(Daemon):
             )
         except Exception:
             logger.exception("pfSense sync failed")
+
+    def _handle_system_cfg(self, raw):
+        """Handle the controller's system_cfg setparam: an EdgeOS-style JSON
+        config containing firewall groups (network/address/port), global
+        firewall options, etc. Parsed and dumped for inspection; firewall
+        groups are a future input for the pfSense alias sync."""
+        try:
+            cfg = pfsense_sync.parse_cfg(raw)
+        except ValueError as e:
+            logger.warning("Could not parse system_cfg: %s", e)
+            self._record_unhandled(
+                "setparam",
+                "system_cfg",
+                {"_type": "setparam", "key": "system_cfg", "error": str(e)},
+            )
+            return
+
+        self._system_cfg = cfg
+        logger.info("system_cfg received with sections: %s", ", ".join(sorted(cfg)))
+        cfg_file = os.path.join(os.path.dirname(CONFIG_FILE), "system_cfg.json")
+        try:
+            with open(cfg_file, "w") as f:
+                json.dump(cfg, f, indent=2, sort_keys=True)
+        except OSError as e:
+            logger.debug("Could not write system_cfg dump: %s", e)
 
     def _send_inform(self, data, encryption="CBC"):
         headers = {
