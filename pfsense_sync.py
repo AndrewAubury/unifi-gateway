@@ -583,22 +583,33 @@ def _reconcile(
         op, name, rule, existing_rule = action
         try:
             if op == "create":
-                client.request("POST", single_path, body=rule)
+                # RESTAPI v2 defaults apply=false: mutations would only be
+                # staged in pending revisions and never committed to
+                # config.xml (verified live: the /firewall/apply endpoint
+                # does not flush them on some builds). Force the commit.
+                client.request("POST", single_path, body={**rule, "apply": True})
                 stats["created"] += 1
                 logger.info("pfSense sync: created %s %r", label, name)
             elif op == "update":
                 # Some RESTAPI builds read the target id from the JSON body
-                # rather than the query string, so send it in both.
+                # rather than the query string, so send it in both -- plus
+                # apply=True so the change is actually committed.
                 body = dict(rule)
                 body["id"] = existing_rule["id"]
+                body["apply"] = True
                 client.request(
                     "PATCH", single_path, body=body, params={"id": existing_rule["id"]}
                 )
                 stats["updated"] += 1
                 logger.info("pfSense sync: updated %s %r", label, name)
             elif op == "delete":
+                # The id and apply control parameter travel in the JSON body
+                # (verified live); the query param is kept for compatibility.
                 client.request(
-                    "DELETE", single_path, params={"id": existing_rule["id"]}
+                    "DELETE",
+                    single_path,
+                    body={"id": existing_rule["id"], "apply": True},
+                    params={"id": existing_rule["id"]},
                 )
                 stats["deleted"] += 1
                 logger.info("pfSense sync: deleted %s %r", label, name)

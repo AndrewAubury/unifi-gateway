@@ -500,6 +500,12 @@ class FakePfSense:
 
     def request(self, method, path, body=None, params=None):
         self.calls.append((method, path, body, params))
+        # RESTAPI semantics: control params (id, apply) travel in the body
+        idx = None
+        if isinstance(body, dict) and "id" in body:
+            idx = body["id"]
+        elif params and "id" in params:
+            idx = params["id"]
         if path == "/firewall/nat/port_forwards" and method == "GET":
             return [dict(r, id=i) for i, r in enumerate(self.port_forwards)]
         if path == "/firewall/nat/port_forward":
@@ -507,11 +513,11 @@ class FakePfSense:
                 self.port_forwards.append(dict(body))
                 return dict(body)
             if method == "PATCH":
-                target = self.port_forwards[params["id"]]
+                target = self.port_forwards[idx]
                 target.update(body)
                 return target
             if method == "DELETE":
-                self.port_forwards.pop(params["id"])
+                self.port_forwards.pop(idx)
                 return {}
         if path == "/firewall/rules" and method == "GET":
             return [dict(r, id=i) for i, r in enumerate(self.rules)]
@@ -520,11 +526,11 @@ class FakePfSense:
                 self.rules.append(dict(body))
                 return dict(body)
             if method == "PATCH":
-                target = self.rules[params["id"]]
+                target = self.rules[idx]
                 target.update(body)
                 return target
             if method == "DELETE":
-                self.rules.pop(params["id"])
+                self.rules.pop(idx)
                 return {}
         if path == "/firewall/aliases" and method == "GET":
             return [dict(a, id=i) for i, a in enumerate(self.aliases)]
@@ -533,11 +539,11 @@ class FakePfSense:
                 self.aliases.append(dict(body))
                 return dict(body)
             if method == "PATCH":
-                target = self.aliases[params["id"]]
+                target = self.aliases[idx]
                 target.update(body)
                 return target
             if method == "DELETE":
-                self.aliases.pop(params["id"])
+                self.aliases.pop(idx)
                 return {}
         if path == "/firewall/apply":
             if method == "GET":
@@ -619,6 +625,26 @@ class TestReconcile:
         assert patches
         for _method, _path, body, params in patches:
             assert body["id"] == params["id"]
+
+    def test_mutations_force_apply(self):
+        """RESTAPI v2 defaults apply=false: without apply=true the API only
+        stages changes in pending revisions and never commits them to
+        config.xml (verified live on v2.4.3). Every mutation must force it."""
+        fake = FakePfSense(port_forwards=[_forward("gone")])
+        pfsense_sync._reconcile(
+            fake,
+            "/firewall/nat/port_forwards",
+            "/firewall/nat/port_forward",
+            [_forward("fresh")],
+            pfsense_sync.PORT_FORWARD_FIELDS,
+            "port forward",
+        )
+        mutations = [c for c in fake.calls if c[0] in ("POST", "PATCH", "DELETE")]
+        assert len(mutations) == 2  # create fresh, delete gone
+        for method, _path, body, _params in mutations:
+            assert body["apply"] is True
+            if method != "POST":
+                assert "id" in body
 
     def test_idempotent(self):
         fake = FakePfSense(port_forwards=[_forward("stable")])
