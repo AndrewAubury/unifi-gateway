@@ -33,6 +33,7 @@ python unifi_gateway.py --help         # CLI smoke check (also run in CI)
 - `conf/unifi-gateway.conf`, `conf/unhandled_commands.json`, and `conf/controller_cfg.json` are gitignored runtime files; the template is `conf/unifi-gateway.sample.conf`.
 - `conf/unhandled_commands.json` (path via `UNIFI_GW_UNHANDLED_LOG`) is a living TODO of controller operations we don't act on (unknown response types, commands, setparam/mgmt_cfg keys). When you implement one, remove its entry from the log.
 - Inform protocol (`unifi_protocol.py`): `TNBU` magic + flags that select AES-CBC vs AES-GCM and zlib vs snappy. Uses `MASTER_KEY` while unadopted, device-specific authkey after adoption.
+- Adoption gotchas (verified on UniFi Network 10.6 self-hosted): modern controllers do **not** auto-register devices from an inform alone (unknown MAC → HTTP 404); the pending entry comes from the L2 discovery broadcast (UDP 10001 multicast), which needs `disable_broadcast = False` and, in Docker, `network_mode: host` for the adoption phase. UniFi OS models (UCG-Ultra, UXG) are NOT registrable via this classic path on some self-hosted installs (inform 404 regardless of MAC; their HTTPS inform endpoint often isn't published) — the UGW3 identity is the reliable fallback, at the cost of the controller's 10.6 update freeze. See the README troubleshooting note.
 - Daemon commands `start`/`stop`/`restart` (double-fork `daemon.py`) are Unix-only; `run` works everywhere.
 
 ## Conventions & gotchas
