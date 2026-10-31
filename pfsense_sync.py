@@ -573,13 +573,21 @@ def apply_config(client, cfg, ports, system_cfg=None, allow_unsafe=False):
         for op in ("created", "updated", "deleted")
     )
     if changed:
+        # Explicit reload after any change. API mutations request auto-apply
+        # by default, but that is not guaranteed on every RESTAPI install
+        # (and its apply settings differ) -- always reload and confirm.
         try:
-            pending = client.request("GET", "/firewall/apply") or {}
-            if not pending.get("applied", True):
-                client.request("POST", "/firewall/apply")
-                logger.info("pfSense sync: firewall changes applied")
+            status = client.request("POST", "/firewall/apply") or {}
+            if status.get("applied", True):
+                logger.info("pfSense sync: firewall changes applied and reloaded")
+            else:
+                logger.warning(
+                    "pfSense sync: pfSense still reports pending subsystems "
+                    "after apply: %s",
+                    status.get("pending_subsystems"),
+                )
         # Same deliberate broad catch: apply is best-effort after a good sync
         except Exception as e:  # noqa: BLE001
-            logger.warning("pfSense sync: firewall apply check failed: %s", e)
+            logger.warning("pfSense sync: firewall apply failed: %s", e)
 
     return stats

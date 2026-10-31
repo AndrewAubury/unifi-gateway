@@ -364,6 +364,7 @@ class FakePfSense:
         self.rules = []
         self.aliases = []
         self.calls = []
+        self.applied = False
 
     def request(self, method, path, body=None, params=None):
         self.calls.append((method, path, body, params))
@@ -406,8 +407,12 @@ class FakePfSense:
             if method == "DELETE":
                 self.aliases.pop(params["id"])
                 return {}
-        if path == "/firewall/apply" and method == "GET":
-            return {"applied": True, "pending_subsystems": []}
+        if path == "/firewall/apply":
+            if method == "GET":
+                return {"applied": True, "pending_subsystems": []}
+            if method == "POST":
+                self.applied = True
+                return {"applied": True, "pending_subsystems": []}
         raise AssertionError(f"unexpected {method} {path}")
 
 
@@ -540,6 +545,8 @@ class TestApplyConfig:
         assert fake.rules[0]["destination"] == "corporate_network"
         # no port-forward rules in system_cfg
         assert stats["port_forwards"]["created"] == 0
+        # any change must trigger an explicit firewall reload
+        assert fake.applied is True
 
     def test_system_cfg_idempotent(self):
         fake = FakePfSense()
@@ -558,6 +565,8 @@ class TestApplyConfig:
             if c[0] in ("POST", "PATCH", "DELETE")
         ]
         assert mutations == []
+        # no change -> no reload either
+        assert all(c[1] != "/firewall/apply" for c in fake.calls[calls_after_first:])
 
     def test_no_changes_no_mutations(self):
         # Seed pfSense with exactly what apply_config would create
