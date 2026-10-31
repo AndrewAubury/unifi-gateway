@@ -6,7 +6,11 @@ services:
     build: .
     container_name: unifi-gateway
     restart: unless-stopped
-    network_mode: host
+    # Remote pfSense mode (platform = pfsense-api) collects everything over the
+    # REST API, so plain bridge networking is fine. Only enable host networking
+    # when running a LOCAL collector (platform = linux/openwrt/...) that needs
+    # to read the host's real interfaces (Linux only).
+    # network_mode: host
     volumes:
       - ./conf:/app/conf
       - ./speedtest.json:/app/speedtest.json:ro
@@ -14,3 +18,6 @@ services:
       - UNIFI_GW_LOG_LEVEL=INFO
       - UNIFI_GW_CONFIG=/app/conf/unifi-gateway.conf
       # - UNIFI_ADOPT_URL=http://your-controller:8080/inform
+      # Keep pfSense credentials out of the mounted config file if preferred:
+      # - UNIFI_GW_PFSENSE_URL=https://10.0.0.1
+      # - UNIFI_GW_PFSENSE_API_KEY=your-pfsense-api-key

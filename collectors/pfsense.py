@@ -1,15 +1,15 @@
-# -*- coding: utf-8 -*-
-"""pfSense-specific data collection.
+"""pfSense-specific data collection (running ON the router).
 
-Extends FreeBSD collector with pfSense API integration.
+For collecting from a REMOTE pfSense via its REST API instead, use
+platform = pfsense-api (collectors.pfsense_api.PfSenseAPICollector).
 """
+
 import logging
 
 from .freebsd import FreeBSDCollector
 
-logger = logging.getLogger('unifi-gateway')
+logger = logging.getLogger("unifi-gateway")
 
 
 class PfSenseCollector(FreeBSDCollector):
-    # TODO: pfSense API integration
     pass

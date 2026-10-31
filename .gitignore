@@ -5,5 +5,6 @@ venv
 __pycache__
 conf/unifi-gateway.conf
 conf/unhandled_commands.json
+conf/controller_cfg.json
 speedtest.json
 *.pid

@@ -47,6 +47,7 @@ jobs:
           import tools
           import tlv
           import daemon
+          import pfsense_sync
           "
 
       - name: CLI help check
